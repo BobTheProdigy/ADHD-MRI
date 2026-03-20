@@ -1,0 +1,863 @@
+
+# =====================================
+# Imports
+# =====================================
+
+import math
+import multiprocessing
+import os
+from pathlib import Path
+import pandas as pd
+import re
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim.lr_scheduler as lr_scheduler
+from torch.utils.data import Dataset, DataLoader
+import nibabel as nib
+from collections import Counter
+import numpy as np
+import matplotlib.pyplot as plt
+from nilearn.image import resample_to_img
+from nilearn.datasets import load_mni152_template
+from sklearn.model_selection import train_test_split
+import time
+import datetime
+import torchvision.transforms as transforms
+import random   
+import msvcrt # for timed user input questions
+import warnings # for ignoring warnings
+import multiprocessing # for parallel processing of MRI resampling, up to 4-8X, pip install multiprocess
+from tqdm import tqdm # used for progress bar
+import sys
+import cv2
+from scipy.ndimage import affine_transform
+
+
+import calculateAccuracy
+import checkpoints # file import
+import makeLinearGraphs # file import
+import sendEmail # file import
+import graphAccuracyEmail # file import
+
+from itertools import product
+
+
+'''
+convert MNI bounding box to voxel coords
+crop
+resize to CNN size
+resampling is non-negotiable, it sees different anatomical scales, ruining performance
+
+Common CV methods:
+1. Random cropping - helps focus on various parts rather than just center
+ --- voxel cropping is only safe if all scans registered to MNI template, have identical voxel spacing
+'''
+# MRI Shapes: (197, 233, 189) -- voxels: 8675289
+
+# =====================================
+# Helper Functions
+# ====================================
+
+def _apply_axial_affine(img_tensor_hwD, device, theta_2x3):
+    """
+    Helper: apply a single 2x3 affine (same for all slices) to every axial slice in a batch.
+    - img_tensor_hwD: (H, W, D) CPU tensor
+    - theta_2x3: torch.Tensor shape (2,3) on same device
+    Returns: (H, W, D) CPU tensor
+    """
+    H, W, D = img_tensor_hwD.shape
+
+    # Move to device and reshape to (D, C=1, H, W) so we can process all slices in batch
+    slices = img_tensor_hwD.permute(2, 0, 1).unsqueeze(1).to(device)  # (D,1,H,W)
+
+    # Expand theta to (D, 2, 3)
+    theta = theta_2x3.unsqueeze(0).expand(D, -1, -1).to(device)      # (D,2,3)    # Create sampling grid and sample
+    grid = F.affine_grid(theta, size=slices.size(), align_corners=False)  # (D, H, W, 2)
+    out = F.grid_sample(slices, grid, align_corners=False)               # (D,1,H,W)
+
+    # Back to (H,W,D) on CPU
+    out = out.squeeze(1).permute(1, 2, 0)
+    return out
+
+
+def random_rotation(img_tensor, device, max_angle=90.0):
+    """
+    Rotate each axial slice by the same random angle.
+    img_tensor: (H,W,D) CPU tensor (float32)
+    """
+    # allow (1,H,W,D) tensors from Dataset
+    if img_tensor.dim() == 4:
+        img_tensor = img_tensor.squeeze(0)
+    angle = math.radians(random.uniform(-max_angle, max_angle))
+    cos, sin = math.cos(angle), math.sin(angle)
+    theta = torch.tensor([[cos, -sin, 0.0],
+                          [sin,  cos, 0.0]], dtype=torch.float32)
+    return _apply_axial_affine(img_tensor, device, theta)
+
+
+def random_translation(img_tensor, device, max_shift=5):
+    """
+    Translate each axial slice by the same random tx,ty in pixels.
+    img_tensor: (H,W,D) CPU tensor
+    """
+    # allow (1,H,W,D) tensors from Dataset
+    if img_tensor.dim() == 4:
+        img_tensor = img_tensor.squeeze(0)
+    H, W, _ = img_tensor.shape
+    tx_pixels = random.uniform(-max_shift, max_shift)
+    ty_pixels = random.uniform(-max_shift, max_shift)
+
+    # normalize to [-1,1] for affine_grid (translation needs to be scaled by 2/width or 2/height)
+    tx = (2.0 * tx_pixels) / W
+    ty = (2.0 * ty_pixels) / H
+
+    theta = torch.tensor([[1.0, 0.0, tx],
+                          [0.0, 1.0, ty]], dtype=torch.float32)
+    return _apply_axial_affine(img_tensor, device, theta)
+
+
+def random_shear(img_tensor, device, max_shear=0.15):
+    """
+    Shear each axial slice by the same (shx, shy).
+    img_tensor: (H,W,D) CPU tensor
+    """
+    # allow (1,H,W,D) tensors from Dataset
+    if img_tensor.dim() == 4:
+        img_tensor = img_tensor.squeeze(0)
+    shx = random.uniform(-max_shear, max_shear)
+    shy = random.uniform(-max_shear, max_shear)
+
+    theta = torch.tensor([[1.0, shx, 0.0],
+                          [shy, 1.0, 0.0]], dtype=torch.float32)
+    return _apply_axial_affine(img_tensor, device, theta)
+
+def extract_subject_id(path):
+    match = re.search(r"sub-(\d+)", path.name)
+    return match.group(1).lstrip("0")
+
+def normalize_dx(dx):
+    DX_MAP = {
+        "typical": "TDC",
+        "control": "TDC",
+        "combined": "ADHD-C",
+        "inattentive": "ADHD-I",
+        "hyper": "ADHD-H",
+    }
+
+    dx = str(dx).lower() # removed .strip()
+    for key, value in DX_MAP.items():
+        if key in dx:
+            return value
+    return None
+
+def datasetLookup(root):
+    dx_lookup = {}
+    print("Building subject -> DX lookup...")
+
+    for site_dir in root.iterdir():
+        if site_dir.is_dir():  # only reads folders (directories)
+            print(f"Processing site: {site_dir.name}...")
+            try:
+                tsv_path = site_dir / "participants.tsv"
+                df = pd.read_csv(tsv_path, sep="\t", encoding="latin1")
+
+                for pid, dx in zip(df["participant_id"], df["dx"]):
+                    clean_id = str(pid).lstrip("0")
+                    norm_dx = normalize_dx(dx)
+                    if norm_dx is not None:
+                        dx_lookup[clean_id] = norm_dx
+                # print(f"[OK] {site_dir.name}: {len(df)} subjects")
+            except FileNotFoundError as e:
+                print(f"[Warning] {e}: {site_dir.name} participants.tsv not found. Skipping this site.")
+                
+    print(f"Total unique subjects in lookup: {len(dx_lookup)}")
+    return dx_lookup
+
+def pairMRIsWithLabels(dx_lookup, root):
+    paired_paths = {}
+    labels = []
+    print("folders:", [p.name for p in root.iterdir() if p.is_dir()])
+    print("\nPairing MRI scans with labels...")
+    for i, nii in enumerate(root.rglob("*_T1w.nii.gz")):
+        sid = extract_subject_id(nii)
+        if sid is None:
+            print(f"Warning: Could not extract subject ID from filename {nii.name}")
+            continue
+
+        dx = dx_lookup.get(sid)
+        if dx is None:
+            print(f"Warning: No DX label found for subject ID {sid} (file: {nii.name})")
+            continue
+
+        paired_paths[i] = nii
+        labels.append(dx)
+
+    print(f"Total MRI scans paired with labels: {len(paired_paths)}")
+    return paired_paths, labels
+
+def load_MRIs(X_paths, device):
+    images = []
+    for mri in X_paths:
+        img = nib.load(mri)
+        data = img.get_fdata().astype(np.float32) # fdata = floating-point data
+        # data = np.expand_dims(data, 0) # add channel dimension for PyTorch (C, D, H, W)
+        images.append(torch.tensor(data, dtype=torch.float32, device=device))
+    return images
+
+def resample_MRIs(X_paths):
+    """
+    Resamples all MRIs to 1mm MNI152 template,
+    canonicalizes to RAS+, and safely overwrites files
+    using atomic replacement to prevent corruption.
+    """
+    print("\nResampling and resaving MRI scans...")
+    template = load_mni152_template(resolution=1)
+
+    shapes = Counter()
+    zooms = set()
+    processed_count = 0
+
+    for p in(X_paths.values()):
+        p = Path(p)
+
+        try:
+            img = nib.load(p)
+            img = nib.as_closest_canonical(img)
+
+            # Resample to template
+            img = resample_to_img(
+                img,
+                template,
+                interpolation='continuous',
+                force_resample=False,
+                copy_header=True
+            )
+
+        except Exception as e:
+            print(f"Error processing file {p}:")
+            print(e)
+            continue
+
+        # Track shape + zoom consistency
+        shapes[img.shape] += 1
+        zooms.add(img.header.get_zooms())
+
+        # print(f"scan {p.key()+1}: {img.shape} -- voxels: {np.prod(img.shape)}")
+
+        # --- Safe Save ---
+        try:
+            if p.name.endswith(".nii.gz"):
+                tmp_path = p.with_name(p.name.replace(".nii.gz", "_tmp.nii.gz"))
+            else:
+                tmp_path = p.with_name(p.stem + "_tmp" + p.suffix)
+
+            nib.save(img, tmp_path)
+
+            # Atomic replacement (prevents half-written files)
+            tmp_path.replace(p)
+
+            processed_count += 1
+
+        except Exception as e:
+            print(f"Error saving file {p}:\n{e}")
+            continue
+
+    print("\n============================")
+    print(f"Finished processing {processed_count} scans.")
+    print("============================\n")
+
+    if len(zooms) > 1:
+        print("Warning: Multiple voxel spacings found:")
+        for z in zooms:
+            print(z)
+
+    if len(shapes) > 1:
+        print("Warning: Multiple shapes found after resampling:")
+        for shape, count in shapes.items():
+            print(f"{shape} -- count: {count}")
+    print('Finished resampling and resaving.\n')
+    return None
+
+def labelEncodingY(y_labels):
+    print("\nEncoding labels for binary ADHD classification...")
+
+    # Map all ADHD subtypes to 1, TDC (typically control) to 0
+    y_binary = []
+    for label in y_labels:
+        if label == "TDC":
+            y_binary.append(0)
+        else:  # Any ADHD subtype
+            y_binary.append(1)
+
+    print("\nConverting labels to PyTorch tensor...")
+    # Use float for BCEWithLogitsLoss
+    y = torch.tensor(y_binary, dtype=torch.float32).unsqueeze(1)
+    print('initial torch shape:', y.shape)
+    return y
+
+def timed_yes_no(prompt, timeout=10, default=False):
+    while True:
+        print(f"{prompt} (y/n) [default={'y' if default else 'n'}]: ", end="", flush=True)
+        start_time = time.time()
+        user_input = ""
+        while (time.time() - start_time) < timeout:
+            if msvcrt.kbhit():
+                char = msvcrt.getwch()
+
+                if char == '\r':  # Enter
+                    print()
+                    if not user_input.strip():
+                        return default
+                    answer = user_input.strip().lower()
+                    if answer in ["y", "yes"]:
+                        return True
+                    elif answer in ["n", "no"]:
+                        return False
+                    else:
+                        print("Please enter 'y' or 'n'.\n")
+                        break  # restart outer loop
+                elif char == '\b':
+                    user_input = user_input[:-1]
+                    print("\b \b", end="", flush=True)
+                else:
+                    user_input += char
+                    print(char, end="", flush=True)
+            time.sleep(0.05)
+        else:
+            # Timeout occurred
+            print("\nTimeout reached. Using default.")
+            return default
+
+# --- Updated balanceDatasets ---
+def balanceDatasets(X_paths, y, save_dir, device):
+
+    if not isinstance(y, torch.Tensor):
+        raise TypeError("y must be a torch.Tensor")
+
+    if y.dim() == 2 and y.size(1) == 1:
+        y = y.view(-1)
+    elif y.dim() != 1:
+        y = y.view(-1)
+
+    num_TDC = int((y == 0).sum().item())
+    num_ADHD = int((y == 1).sum().item())
+
+    print("\nLabel distribution: 0 (TDC):", num_TDC, " 1 (ADHD):", num_ADHD)
+
+    if num_TDC == num_ADHD:
+        print("Already balanced.")
+        return X_paths, y
+
+    more_ADHD_needed = num_ADHD < num_TDC
+    to_generate = abs(num_TDC - num_ADHD)
+
+    print(f"Need to generate {to_generate} samples for {'ADHD' if more_ADHD_needed else 'TDC'}.")
+
+    ADHD_indices = (y == 1).nonzero(as_tuple=True)[0].tolist()
+    TDC_indices  = (y == 0).nonzero(as_tuple=True)[0].tolist()
+
+    source_indices = ADHD_indices if more_ADHD_needed else TDC_indices
+    label_to_add = 1 if more_ADHD_needed else 0
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    next_key = (max(X_paths.keys()) + 1) if X_paths else 0
+
+    transforms = [random_rotation, random_translation, random_shear]
+
+    generated = 0
+    new_label_list = []
+
+    # --- TSV storage ---
+    tsv_rows = []
+
+    while generated < to_generate:
+        print(f"Generating samples ({generated + 1}-{generated + 3})/{to_generate}...")
+
+        idx = random.choice(source_indices)
+        path = X_paths[idx]
+
+        nii = nib.load(path)
+        data = nii.get_fdata().astype(np.float32)
+        affine = nii.affine
+
+        data = (data - data.mean()) / (data.std() + 1e-6)
+        tensor = torch.from_numpy(data)
+
+        # --- locate the correct participants.tsv ---
+        site_dir = Path(path).parents[3]
+        tsv_path = site_dir / "participants.tsv"
+
+        if not tsv_path.exists():
+            print(f"[Warning] TSV not found for {path} in {site_dir}")
+            continue
+
+        df = pd.read_csv(tsv_path, sep="\t", encoding="latin1")
+
+        pid = str(int(Path(path).parents[2].name.replace("sub-", "")))
+
+        row = df[df["participant_id"].astype(str) == pid]
+
+        if row.empty:
+            print(f"[Warning] No TSV row for subject {pid} in {tsv_path}")
+            continue
+
+        base_row = row.iloc[0].copy()
+
+        for transform in transforms:
+
+            if generated >= to_generate:
+                break
+
+            aug_tensor = transform(tensor, device)
+
+            aug_np = aug_tensor.numpy()
+
+            new_name = f"sub-{next_key}_T1w.nii.gz"
+            new_path = os.path.join(save_dir, new_name)
+
+            nib.save(nib.Nifti1Image(aug_np, affine), new_path)
+
+            X_paths[next_key] = new_path
+            new_label_list.append(label_to_add)
+
+            # ---- Create new TSV row ----
+            new_row = base_row.copy()
+            new_row["participant_id"] = f"{next_key}"
+
+            tsv_rows.append(new_row)
+
+            next_key += 1
+            generated += 1
+
+    # Append labels
+    if new_label_list:
+        new_lbls = torch.tensor(new_label_list, dtype=y.dtype, device=y.device)
+        y = torch.cat([y, new_lbls], dim=0)
+
+    # Save TSV
+    if tsv_rows:
+        new_df = pd.DataFrame(tsv_rows)
+        new_tsv_path = os.path.join(save_dir, "participants.tsv")
+        new_df.to_csv(new_tsv_path, sep="\t", index=False)
+
+        print(f"Saved new participants.tsv with {len(new_df)} entries")
+
+    new_TDC = int((y == 0).sum().item())
+    new_ADHD = int((y == 1).sum().item())
+
+    print("New label distribution: 0 (TDC):", new_TDC, " 1 (ADHD):", new_ADHD)
+    print(f"Generated {generated} volumes.")
+
+    return X_paths, y
+
+def splitDatasets(X_paths, y, device, shuffleTrain):
+    keys = list(X_paths.keys())
+
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        keys, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+
+    validation_keys, test_keys, y_validation, y_test = train_test_split(
+        X_test, y_test, test_size=0.5, random_state=42, stratify = y_test
+    )
+
+    # making lists into dictionaries again for dataset class
+    X_train = {k: X_paths[k] for k in X_train}
+    X_validation = {k: X_paths[k] for k in validation_keys}
+    X_test = {k: X_paths[k] for k in test_keys}
+
+
+    train_dataset = MRIDataset(X_train, y_train, device, augment=False) # need to look through this class, don't understand all the transformations
+    val_dataset   = MRIDataset(X_validation, y_validation, device, augment=False)
+    test_dataset  = MRIDataset(X_test, y_test, device, augment=False)
+    print('Train dataset device:', train_dataset.device, 'Validation dataset device:', val_dataset.device, 'Test dataset device:', test_dataset.device)
+
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=shuffleTrain, num_workers=0, pin_memory=True)
+    val_loader   = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=0, pin_memory=True)
+    test_loader  = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=0, pin_memory=True)
+    return train_loader, val_loader, test_loader
+
+def preprocess_and_save(X_paths, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    new_paths = {}
+    for key, path in X_paths.items():
+        data = nib.load(path).get_fdata().astype(np.float32)
+        data = (data - np.mean(data)) / (np.std(data) + 1e-6)
+        tensor = torch.tensor(data, dtype = torch.float32)
+        new_path = os.path.join(save_dir, f"{key}.pt")
+        torch.save(tensor, new_path)
+        new_paths[key] = new_path
+    return new_paths
+
+def load_preprocessed_paths(X_paths, preprocessed_dir):
+    new_paths = {}
+    for key in X_paths.keys():
+        tensor_path = os.path.join(preprocessed_dir, f"{key}.pt")
+        new_paths[key] = tensor_path
+    return new_paths
+
+class AlexNet(nn.Module):
+    def __init__(self, num_classes=1): # ADHD positive/negative
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv3d(1, 96, kernel_size=11, stride=4),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=3, stride=2),
+
+            nn.Conv3d(96, 256, kernel_size=5, padding=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=3, stride=2),
+
+            nn.Conv3d(256, 384, kernel_size=3, padding=1), # change back to 256, testing simpler model to avoid overfitting
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(384, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=3, stride=2),
+
+            nn.AdaptiveAvgPool3d((1, 1, 1)),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(),
+            nn.Linear(256, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(),
+            nn.Linear(4096, 4096),
+            nn.ReLU(inplace=True),
+            nn.Linear(4096, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        return self.classifier(x)
+
+class MRIDataset(Dataset):
+    def __init__(self, X_dict, y, device, augment=False, rotation_max=15, noise_level=0.01):
+        """
+        X_dict: dict mapping keys -> file paths
+        y: labels (tensor or list)
+        device: torch device to load tensors onto
+        augment: whether to apply random augmentation
+        rotation_max: max rotation in degrees
+        noise_level: standard deviation for additive noise
+        """
+        self.keys = list(X_dict.keys())
+        self.paths = X_dict
+        self.y = y
+        self.augment = augment
+        self.device = device
+        # self.rotation_max = rotation_max
+        # self.noise_level = noise_level
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, idx):
+
+        key = self.keys[idx]
+        path = self.paths[key]
+
+        # Load tensor (H, W, D)
+        scan = torch.load(path, self.device, weights_only=True)
+
+        # Apply augmentation BEFORE adding channel dimension
+        if self.augment and random.random() < 0.5:
+            transform = random.choice([
+                "rotation",
+                "translation",
+                "shear",
+            ])
+            # print('applying transformation on device:', self.device)
+            if transform == "rotation":
+                scan = random_rotation(scan, device=self.device)
+            elif transform == "translation":
+                scan = random_translation(scan, device=self.device)
+            elif transform == "shear":
+                scan = random_shear(scan, device=self.device)
+
+        # Add channel dimension for Conv3D
+        if scan.dim() == 3:
+            scan = scan.unsqueeze(0)   # -> (1, H, W, D)
+
+        label = self.y[idx]
+
+        return scan, label
+
+
+def trueMain(schedulerPatience, schedulerFactor, lr, early_stop_patience, shuffleTrain):
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print("Using device:", device)
+
+
+        print('loading AlexNet to device...')
+        model = AlexNet().to(device)
+
+        #Changed to adamW for better handeling with overfitting: https://optimization.cbe.cornell.edu/index.php?title=AdamW
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+        lossFunction = nn.BCEWithLogitsLoss() # for binary classification, expects raw logits and binary labels
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode = 'min',
+            factor = schedulerFactor,
+            patience = schedulerPatience
+        ) # 'min' to decrease metric, factor - LR multiplicative scale whzen plateau, patience - wait 10 epochs before changing LR by factor
+        trainingLosses = []
+        validationLosses = []
+        accuracyList = []
+        previousTrainingLoops = 0
+
+
+        warnings.filterwarnings("ignore", message="Casting data from int16 to float32")
+        root = Path(r"C:\ADHD MRI Scans")
+        dx_lookup = datasetLookup(root)
+        X_paths, y_labels = pairMRIsWithLabels(dx_lookup, root)
+        resample = timed_yes_no("Resample MRIs? (10s to skip) ", timeout=10, default=False)
+        if resample:
+            resample_MRIs(X_paths)
+        loadCheckpoint = timed_yes_no("Load checkpoint? (10s to skip) ", timeout=10, default=False)
+        if loadCheckpoint:
+            model, optimizer, trainingLosses, validationLosses, accuracy, previousTrainingLoops = checkpoints.loadCheckpoint(model, optimizer, device)
+            print("Checkpoint loaded.\n", flush=True)
+        else:
+            print("Starting fresh training.\n", flush=True)
+        y = labelEncodingY(y_labels)
+        if (y == 1).sum().item() != (y == 0).sum().item():
+            print("Label distribution is imbalanced. Balancing dataset...")
+            X_paths, y = balanceDatasets(X_paths, y, r"C:\ADHD MRI Scans\Generated_Images", device='cpu') # directory to save generated images
+        preprocessed_dir = r"C:\ADHD MRI Scans\Preprocessed_Tensors"
+
+        if not os.path.exists(preprocessed_dir) or len(os.listdir(preprocessed_dir)) == 0:
+            print("Preprocessed tensors not found. Running preprocessing...")
+            new_paths = preprocess_and_save(X_paths, preprocessed_dir)
+        else:
+            print("Using existing preprocessed tensors.")
+            new_paths = load_preprocessed_paths(X_paths, preprocessed_dir)
+        # directory to save preprocessed tensors, can load these directly in dataset class to avoid preprocessing every time, but takes up more disk space, and preprocessing is not the bottleneck, resampling is
+        train_loader, val_loader, test_loader = splitDatasets(new_paths, y, 'cpu', shuffleTrain)
+
+        model = model.to(device)
+
+        # early stopping code
+        early_stop_patience = early_stop_patience
+        min_delta = 0.0001
+        best_val_loss = float('inf')
+        epochs_without_improvement = 0
+
+
+        trainingComplete = False
+        loops = 2000
+        for epoch in tqdm(range(loops), desc="Epochs"):
+            startTime = time.time()
+
+            model.train()
+            total_train_loss = 0
+
+            train_loop = tqdm(
+                train_loader,
+                desc=f"Train Epoch {epoch + 1 + previousTrainingLoops}",
+                leave=False
+            )
+
+            # training loop
+            for scans, labels in train_loop:
+                scans = scans.to(device, non_blocking=True)
+                
+                labels = labels.to(device, non_blocking=True).float()
+                outputs = model(scans)
+                # labels = labels.unsqueeze(0)
+                # print('labels shape:', labels.shape, 'outputs shape:', outputs.shape)
+                loss = lossFunction(outputs, labels)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_train_loss += loss.item()
+                train_loop.set_postfix(loss=loss.item())
+
+            avg_train_loss = total_train_loss / len(train_loader)
+            trainingLosses.append(avg_train_loss)
+
+            model.eval()
+            total_val_loss = 0
+
+            val_loop = tqdm(
+                val_loader,
+                desc=f"Val Epoch {epoch + 1 + previousTrainingLoops}",
+                leave=False
+            )
+
+            # validation loop, just used for human understanding of model performance, does not affect model
+            with torch.no_grad():
+                for scans, labels in val_loop:
+                    scans = scans.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True).float() # .unsqueeze(1)
+                    outputs = model(scans)
+                    # labels = labels.float().unsqueeze(1)
+                    # print('labels shape:', labels.shape, 'outputs shape:', outputs.shape)
+                    loss = lossFunction(outputs, labels)
+
+                    total_val_loss += loss.item()
+                    val_loop.set_postfix(loss=loss.item())
+
+            avg_val_loss = total_val_loss / len(val_loader)
+            validationLosses.append(avg_val_loss)
+
+            scheduler.step(avg_val_loss)
+            if avg_val_loss < best_val_loss - min_delta:
+                best_val_loss = avg_val_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+
+            if epochs_without_improvement >= early_stop_patience:
+                try:
+                    accuracyList = graphAccuracyEmail.graphAccuracyEmail(trainingLosses, validationLosses, accuracyList, model, test_loader, device, epoch, previousTrainingLoops, True,  startTime)
+                except:
+                    print("unable to connect to server for final accuracy email")
+                print("Early stopping triggered.")
+                trainingComplete = True
+                loops = epoch + 1 # to break out of outer loop
+                break
+            else: # calculate accuracy every loop
+                accuracy = calculateAccuracy.calculateAccuracy(model, test_loader, device)
+                print(f"Test Accuracy: {accuracy:.4f}")
+                accuracyList.append(accuracy)
+
+            # Use tqdm-safe printing
+            tqdm.write(f"\nEpoch {epoch + 1+ previousTrainingLoops}: ")
+            tqdm.write(f"Train Loss: {avg_train_loss:.4f}")
+            tqdm.write(f"Val Loss:   {avg_val_loss:.4f}")
+            tqdm.write(
+                f"Time taken: {str(datetime.timedelta(seconds=time.time() - startTime))}"
+            )
+            tqdm.write("-" * 40)
+
+
+            # sending email every 100 epochs
+            if (epoch + 1) % 50 == 0:
+                try:
+                    accuracyList = graphAccuracyEmail.graphAccuracyEmail(trainingLosses, validationLosses, accuracyList, model, test_loader, device, epoch, previousTrainingLoops, False,  startTime)
+                    checkpoint = {}
+                    checkpoint['model'] = model.state_dict() # doesn't change in training_loop so just adding to checkpoint manually
+                    checkpoint['optimizer'] = optimizer.state_dict() # doesn't change in training_loop so just adding to checkpoint manually
+                    checkpoint['trainingLosses'] = trainingLosses
+                    checkpoint['validationLosses'] = validationLosses
+                    checkpoint['accuracy'] = accuracy
+                    checkpoint['loops'] = epoch + 1 + previousTrainingLoops
+                    checkpoints.saveCheckpoint(checkpoint, epoch + 1 + previousTrainingLoops, accuracy)
+                except:
+                    print("unable to connect to server for accuracy email")
+        if not trainingComplete:
+            try:
+                accuracyList = graphAccuracyEmail.graphAccuracyEmail(trainingLosses, validationLosses, accuracyList, model, test_loader, device, epoch, previousTrainingLoops, False,  startTime)
+            except:
+                print("unable to connect to server for final accuracy email")
+
+
+        checkpoint = {}
+        checkpoint['model'] = model.state_dict() # doesn't change in training_loop so just adding to checkpoint manually
+        checkpoint['optimizer'] = optimizer.state_dict() # doesn't change in training_loop so just adding to checkpoint manually
+        checkpoint['trainingLosses'] = trainingLosses
+        checkpoint['validationLosses'] = validationLosses
+        checkpoint['accuracy'] = accuracy
+        checkpoint['loops'] = loops + previousTrainingLoops
+
+        # pngFileName = makeLinearGraphs.makeLinearGraph(trainingLosses, validationLosses) # make plot of training and validation from loops
+        # try:
+        #     sendEmail.sendEmail(len(trainingLosses) + previousTrainingLoops, round(trainingLosses[-1], 2), round(validationLosses[-1], 2), True, pngFileName, accuracy) # boolean is for trainingCompleted
+        # except:
+        #     print("unable to connect to server")
+        checkpoints.saveCheckpoint(checkpoint, loops + previousTrainingLoops)
+        print('goodbye sweet world...')
+        del model
+        torch.cuda.empty_cache() # takes care of memory overload, likely causing crash with num workers
+        return accuracyList[-1]
+        # time.sleep(30) # give time to upload to cloud before shutting down
+        # os.system('shutdown -s')
+
+
+
+def main():  # should only expect to get about 75% maximum accuracy
+    schedulerPatience = [10, 30, 40, 50]
+    schedulerFactor = [0.5, 0.65, 0.75]
+    lr = [1e-6, 1e-5, 5e-5, 1e-4, 3e-4]
+    early_stop_patience = [40, 70]
+    shuffleTrain_options = [True, False]
+
+    results = []
+
+    for sp, sf, learning_rate, esp, shuffleTrain in product(
+        schedulerPatience,
+        schedulerFactor,
+        lr,
+        early_stop_patience,
+        shuffleTrain_options
+    ):
+
+        # Generate unique log filename
+        base_name = "training_log"
+        ext = ".txt"
+        i = 1
+        filename = f"{base_name}{ext}"
+
+        while os.path.exists(filename):
+            i += 1
+            filename = f"{base_name}{i}{ext}"
+
+        log_file = open(filename, "w")
+        old_stdout = sys.stdout
+        sys.stdout = log_file
+
+        print('sp:', sp,
+              'sf:', sf,
+              'lr:', learning_rate,
+              'early_stop_patience:', esp,
+              'shuffleTrain:', shuffleTrain)
+
+        accuracy = trueMain(
+            sp,
+            sf,
+            learning_rate,
+            esp,
+            shuffleTrain
+        )
+
+        # restore console output
+        sys.stdout = old_stdout
+        log_file.close()
+
+        # store experiment result
+        results.append({
+            "schedulerPatience": sp,
+            "schedulerFactor": sf,
+            "lr": learning_rate,
+            "early_stop_patience": esp,
+            "shuffleTrain": shuffleTrain,
+            "accuracy": accuracy
+        })
+    # Convert results to DataFrame
+    df = pd.DataFrame(results)
+    print("\nAll experiment results:")
+    print(df)
+    # Sort by best accuracy
+    df_sorted = df.sort_values(by="accuracy", ascending=False)
+    print("\nBest hyperparameters:")
+    print(df_sorted.iloc[0])
+    # Optional: save results
+    df_sorted.to_csv("hyperparameter_results.csv", index=False)
+    return df_sorted
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()
